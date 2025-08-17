@@ -107,88 +107,68 @@ class EnhancedScheduler:
                 await asyncio.sleep(self.check_interval)
     
     async def _check_for_scheduled_tasks(self):
-        """Check database for videos ready to be processed"""
+        """Check database for scheduled tasks and trigger processing"""
         try:
-            # Get videos that are ready for processing
+            # Get videos ready for processing (past schedule time)
             ready_videos = get_videos_ready_for_processing()
             
-            if not ready_videos:
-                return
-            
-            logger.info(f"🔍 Found {len(ready_videos)} videos ready for processing")
-            
-            # Process each ready video
             for video_data in ready_videos:
-                if len(self.active_tasks) >= self.max_concurrent_tasks:
-                    logger.info(f"⏳ Max concurrent tasks reached ({self.max_concurrent_tasks}), waiting...")
-                    break
-                
-                await self._process_scheduled_video(video_data)
-                
+                if video_data['id'] not in self.active_tasks:
+                    # Create scheduled task
+                    scheduled_task = ScheduledTask(
+                        video_id=video_data['id'],
+                        title=video_data['title'],
+                        description=video_data['description'],
+                        genre=video_data['genre'],
+                        expected_length=video_data['expected_length'],
+                        schedule_time=datetime.fromisoformat(video_data['schedule_time']),
+                        status=video_data['status'],
+                        metadata=video_data.get('extra_metadata', {})
+                    )
+                    
+                    # Add to active tasks
+                    self.active_tasks[video_data['id']] = scheduled_task
+                    
+                    # Trigger workflow callback if available
+                    if self.workflow_callback:
+                        logger.info(f"🚀 Triggering automated processing for video {video_data['id']}")
+                        try:
+                            # Start processing immediately - skip image generation
+                            await self._start_automated_processing(scheduled_task)
+                        except Exception as e:
+                            logger.error(f"❌ Error starting automated processing for video {video_data['id']}: {e}")
+                            # Remove from active tasks on error
+                            if video_data['id'] in self.active_tasks:
+                                del self.active_tasks[video_data['id']]
+                    else:
+                        logger.warning(f"⚠️ No workflow callback available for video {video_data['id']}")
+                        
         except Exception as e:
             logger.error(f"❌ Error checking for scheduled tasks: {e}")
     
-    async def _process_scheduled_video(self, video_data: Dict[str, Any]):
-        """Process a scheduled video"""
-        video_id = video_data['id']
-        
+    async def _start_automated_processing(self, scheduled_task: ScheduledTask):
+        """Start automated processing for a scheduled task - skip image generation"""
         try:
-            # Check if video is already being processed
-            if video_id in self.active_tasks:
-                logger.info(f"⏳ Video {video_id} already being processed")
-                return
+            logger.info(f"🤖 Starting automated processing for video {scheduled_task.video_id}")
             
-            # Check if video still exists and is still pending
-            current_video = get_video_by_id(video_id)
-            if not current_video or current_video['status'] != 'pending':
-                logger.info(f"⚠️ Video {video_id} no longer available or not pending")
-                return
+            # Skip image generation and video assembly - go directly to upload
+            # Update status to uploading immediately
+            update_video_status(scheduled_task.video_id, "uploading")
             
-            # Create scheduled task
-            scheduled_task = ScheduledTask(
-                video_id=video_id,
-                title=video_data['title'],
-                description=video_data['description'],
-                genre=video_data['genre'],
-                expected_length=video_data['expected_length'],
-                schedule_time=video_data['schedule_time'],
-                status=video_data['status'],
-                metadata={
-                    'platforms': video_data.get('platforms'),
-                    'video_type': video_data.get('video_type'),
-                    'music_pref': video_data.get('music_pref'),
-                    'channel_name': video_data.get('channel_name'),
-                    'extra_metadata': video_data.get('extra_metadata')
-                }
-            )
+            logger.info(f"⏭️ Skipped image generation and video assembly for video {scheduled_task.video_id}")
+            logger.info(f"📤 Moving directly to YouTube upload for video {scheduled_task.video_id}")
             
-            # Add to active tasks
-            self.active_tasks[video_id] = scheduled_task
-            
-            # Update status to image generation
-            update_video_status(video_id, 'image_generation')
-            
-            logger.info(f"🎬 Starting scheduled video processing: {video_id} - {video_data['title']}")
-            
-            # Call workflow callback if available
+            # If workflow callback is available, trigger it
             if self.workflow_callback:
-                try:
-                    await self.workflow_callback(scheduled_task)
-                except Exception as e:
-                    logger.error(f"❌ Error in workflow callback for video {video_id}: {e}")
-                    # Mark as failed
-                    update_video_status(video_id, 'failed')
-                    if video_id in self.active_tasks:
-                        del self.active_tasks[video_id]
+                await self.workflow_callback(scheduled_task)
             else:
-                logger.warning(f"⚠️ No workflow callback registered for video {video_id}")
+                logger.warning(f"⚠️ No workflow callback available for video {scheduled_task.video_id}")
                 
         except Exception as e:
-            logger.error(f"❌ Error processing scheduled video {video_id}: {e}")
-            # Mark as failed
-            update_video_status(video_id, 'failed')
-            if video_id in self.active_tasks:
-                del self.active_tasks[video_id]
+            logger.error(f"❌ Error starting automated processing for video {scheduled_task.video_id}: {e}")
+            # Mark as failed if we can't start processing
+            update_video_status(scheduled_task.video_id, "failed")
+            raise
     
     async def schedule_video(self, video_data: Dict[str, Any]) -> bool:
         """Schedule a video for future processing"""

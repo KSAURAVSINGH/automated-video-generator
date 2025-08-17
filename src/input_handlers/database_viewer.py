@@ -6,14 +6,91 @@ import os
 import sqlite3
 import json
 from pathlib import Path
+from datetime import datetime
 
 # Add the src directory to the path to import database modules
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from src.database.db_handler import DB_PATH
+from src.database.db_handler import DB_PATH, delete_all_videos
 
 def view_database():
     st.title("📊 Database Viewer - Saved Videos")
+    
+    # Initialize session state for database viewer persistence
+    if 'db_viewer_last_refresh' not in st.session_state:
+        st.session_state.db_viewer_last_refresh = datetime.now()
+    
+    if 'db_viewer_auto_refresh' not in st.session_state:
+        st.session_state.db_viewer_auto_refresh = True
+    
+    if 'db_viewer_expanded_videos' not in st.session_state:
+        st.session_state.db_viewer_expanded_videos = {}
+    
+    if 'db_viewer_filter_status' not in st.session_state:
+        st.session_state.db_viewer_filter_status = "all"
+    
+    if 'db_viewer_filter_genre' not in st.session_state:
+        st.session_state.db_viewer_filter_genre = "all"
+    
+    # Add delete all button at the top
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.info("💾 View and manage all saved video data in the database")
+    with col2:
+        if st.button("🗑️ Delete All Records", type="secondary"):
+            if st.button("⚠️ Confirm Delete All", key="confirm_delete_all_viewer"):
+                try:
+                    deleted_count = delete_all_videos()
+                    st.success(f"✅ {deleted_count} database records deleted successfully!")
+                    
+                    # Set session state to trigger UI updates everywhere
+                    st.session_state.records_deleted_viewer = True
+                    st.session_state.deleted_count_viewer = deleted_count
+                    
+                    # Clear expanded videos state
+                    st.session_state.db_viewer_expanded_videos = {}
+                    
+                    # Rerun to update all UI components
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"❌ Failed to delete all records: {e}")
+    
+    # Show deletion notification if records were deleted
+    if st.session_state.get('records_deleted_viewer', False):
+        st.success(f"🎉 Successfully deleted {st.session_state.get('deleted_count_viewer', 0)} records from database!")
+        st.info("💡 The UI has been refreshed to reflect the changes. All views will show the updated data.")
+        
+        # Clear the notification after showing
+        del st.session_state.records_deleted_viewer
+        del st.session_state.deleted_count_viewer
+    
+    # Refresh controls
+    st.markdown("---")
+    refresh_col1, refresh_col2, refresh_col3 = st.columns([2, 2, 1])
+    
+    with refresh_col1:
+        # Auto-refresh toggle
+        auto_refresh = st.checkbox(
+            "Auto-refresh every 30 seconds", 
+            value=st.session_state.db_viewer_auto_refresh,
+            key="db_auto_refresh_toggle"
+        )
+        
+        if auto_refresh != st.session_state.db_viewer_auto_refresh:
+            st.session_state.db_viewer_auto_refresh = auto_refresh
+            st.rerun()
+    
+    with refresh_col2:
+        # Manual refresh button
+        if st.button("🔄 Manual Refresh"):
+            st.session_state.db_viewer_last_refresh = datetime.now()
+            st.rerun()
+    
+    with refresh_col3:
+        st.info(f"Last: {st.session_state.db_viewer_last_refresh.strftime('%H:%M:%S')}")
+    
+    st.markdown("---")
     
     try:
         # Connect to database

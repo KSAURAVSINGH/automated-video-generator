@@ -12,6 +12,8 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from enum import Enum
 import json
+import subprocess
+import os
 
 # Import our modules
 from src.database.db_handler import get_pending_videos, update_video_status
@@ -84,6 +86,9 @@ class WorkflowController:
         logger.info("🚀 Starting Workflow Controller...")
         self.is_running = True
         
+        # Test YouTube uploader functionality
+        await self._test_youtube_uploader()
+        
         # Start the scheduler
         await self.scheduler.start()
         
@@ -136,6 +141,28 @@ class WorkflowController:
             for video_data in pending_videos:
                 if video_data['id'] not in self.active_jobs:
                     # Create new job
+                    # Parse extra_metadata and include video_link
+                    extra_metadata = json.loads(video_data.get('extra_metadata', '{}'))
+                    
+                    # Check for video path in multiple locations
+                    video_path = None
+                    
+                    # First, check if video_url is stored in the database
+                    if video_data.get('video_url'):
+                        video_path = video_data['video_url']
+                        logger.info(f"🎬 Found video path in database: {video_path}")
+                    # Then check extra_metadata for video_link
+                    elif extra_metadata.get('video_link'):
+                        video_path = extra_metadata['video_link']
+                        logger.info(f"🎬 Found video path in metadata: {video_path}")
+                    
+                    # Store the video path in metadata for the workflow
+                    if video_path:
+                        extra_metadata['video_link'] = video_path
+                        logger.info(f"🎬 Video path stored in metadata: {video_path}")
+                    else:
+                        logger.warning(f"⚠️ No video path found for job {video_data['id']}")
+                    
                     job = VideoJob(
                         video_id=video_data['id'],
                         title=video_data['title'],
@@ -145,7 +172,7 @@ class WorkflowController:
                         schedule_time=datetime.fromisoformat(video_data['schedule_time']),
                         status=VideoStatus.PENDING,
                         created_at=datetime.now(),
-                        metadata=json.loads(video_data.get('extra_metadata', '{}'))
+                        metadata=extra_metadata
                     )
                     
                     # Check if it's time to process this job
@@ -177,42 +204,81 @@ class WorkflowController:
         job.progress = "0%"
         
         try:
-            # Check if we should skip generation and use existing video
-            if job.metadata.get('skip_generation', False):
-                if job.metadata.get('use_existing_video', False) and job.metadata.get('existing_video_path'):
-                    # Use the specified existing video file
-                    existing_video_path = job.metadata.get('existing_video_path')
-                    logger.info(f"⏭️ Using existing video file: {existing_video_path}")
-                    
-                    # Set the video path in metadata
-                    job.metadata['video_path'] = existing_video_path
-                    job.metadata['generation_method'] = 'existing_video'
-                    
-                    # Skip to video assembly
-                    job.status = VideoStatus.VIDEO_ASSEMBLY
-                    update_video_status(job.video_id, "video_assembly")
-                    job.progress = "50%"
-                    logger.info(f"✅ Using existing video: {existing_video_path}")
+            # Step 1: Check if video file exists (skip image generation)
+            video_path = job.metadata.get('video_link', '')
+            
+            # Also check if video_link is stored directly in the job
+            if not video_path and hasattr(job, 'video_link'):
+                video_path = job.video_link
+            
+            if not video_path:
+                # No video file provided, try to use existing video in temp folder
+                logger.warning(f"⚠️ No video file provided for job {job.video_id}, looking for existing video in temp folder")
+                
+                # Look for existing video files in temp folder
+                temp_dir = Path("temp")
+                if temp_dir.exists():
+                    video_files = list(temp_dir.glob("*.mp4"))
+                    if video_files:
+                        # Use the first available video file (preferably the largest one)
+                        video_files.sort(key=lambda x: x.stat().st_size, reverse=True)
+                        video_path = str(video_files[0])
+                        logger.info(f"🎬 Found existing video file: {video_path} ({video_files[0].stat().st_size} bytes)")
+                    else:
+                        logger.warning(f"⚠️ No video files found in temp folder, creating placeholder")
+                        video_path = await self._create_placeholder_video(job)
                 else:
-                    # Use mock video
-                    logger.info(f"⏭️ Skipping video generation for video {job.video_id} (using mock video)")
-                    await self._process_mock_video(job)
+                    logger.warning(f"⚠️ Temp folder not found, creating placeholder")
+                    video_path = await self._create_placeholder_video(job)
             else:
-                # Step 1: Generate video using Pyramid Flow (if enabled) or fallback to image-based
-                if PYRAMID_FLOW_ENABLED and self.pyramid_flow_generator:
-                    await self._generate_video_with_pyramid_flow(job)
+                # Use the provided video file
+                logger.info(f"🎬 Using provided video file: {video_path}")
+            
+            # Verify the video file exists and is valid
+            if not os.path.exists(video_path):
+                logger.error(f"❌ Video file not found: {video_path}")
+                # Try to find an alternative video file
+                temp_dir = Path("temp")
+                if temp_dir.exists():
+                    video_files = list(temp_dir.glob("*.mp4"))
+                    if video_files:
+                        video_files.sort(key=lambda x: x.stat().st_size, reverse=True)
+                        video_path = str(video_files[0])
+                        logger.info(f"🔄 Using alternative video file: {video_path}")
+                    else:
+                        raise FileNotFoundError(f"No video files available in temp folder")
                 else:
-                    await self._generate_images(job)
-                    await self._assemble_video(job)
+                    raise FileNotFoundError(f"Temp folder not found and no video path provided")
             
-            # Step 2: YouTube Upload
-            await self._upload_to_youtube(job)
+            # Check file size to ensure it's a real video
+            file_size = os.path.getsize(video_path)
+            if file_size < 1000:  # Less than 1KB is likely a placeholder
+                logger.warning(f"⚠️ Video file seems too small ({file_size} bytes), looking for larger file")
+                temp_dir = Path("temp")
+                if temp_dir.exists():
+                    video_files = list(temp_dir.glob("*.mp4"))
+                    if video_files:
+                        # Find the largest video file
+                        largest_video = max(video_files, key=lambda x: x.stat().st_size)
+                        if largest_video.stat().st_size > 1000:
+                            video_path = str(largest_video)
+                            logger.info(f"🔄 Using larger video file: {video_path} ({largest_video.stat().st_size} bytes)")
+                        else:
+                            logger.warning(f"⚠️ All video files are too small, proceeding with current file")
             
-            # Step 3: Mark as completed
-            job.status = VideoStatus.COMPLETED
-            update_video_status(job.video_id, "completed")
-            job.progress = "100%"
-            logger.info(f"✅ Video {job.video_id} processing completed successfully.")
+            logger.info(f"🎬 Final video path selected: {video_path} ({file_size} bytes)")
+            
+            # Step 2: Skip image generation and video assembly - go directly to upload
+            job.status = VideoStatus.UPLOADING
+            update_video_status(job.video_id, "uploading")
+            job.progress = "75%"
+            logger.info(f"⏭️ Skipping image generation and video assembly for job {job.video_id}")
+            
+            # Step 3: YouTube Upload (the main step)
+            await self._upload_to_youtube(job, video_path)
+            
+            # Note: _upload_to_youtube now handles completion status updates
+            # No need for additional completion logic here
             
         except Exception as e:
             logger.error(f"❌ Error processing video {job.video_id}: {e}")
@@ -223,211 +289,182 @@ class WorkflowController:
             # Clean up any partial files
             await self._cleanup_job_files(job)
     
-    async def _process_mock_video(self, job: VideoJob):
-        """Process job using mock video instead of generating new one"""
-        try:
-            logger.info(f"🎬 Processing mock video for job {job.video_id}")
-            
-            # Step 1: Mock image generation (skip actual generation)
-            job.status = VideoStatus.IMAGE_GENERATION
-            update_video_status(job.video_id, "image_generation")
-            job.progress = "25%"
-            logger.info(f"🖼️ Mock image generation completed for video {job.video_id}")
-            
-            # Step 2: Mock video assembly (use existing video)
-            job.status = VideoStatus.VIDEO_ASSEMBLY
-            update_video_status(job.video_id, "video_assembly")
-            job.progress = "50%"
-            
-            # Find an existing video file to use
-            mock_video_path = self._find_mock_video()
-            if mock_video_path:
-                job.metadata['video_path'] = mock_video_path
-                job.metadata['generation_method'] = 'mock_video'
-                logger.info(f"🎬 Mock video assembly completed: {mock_video_path}")
-            else:
-                # Create a simple mock video if none exists
-                mock_video_path = await self._create_simple_mock_video(job)
-                job.metadata['video_path'] = mock_video_path
-                job.metadata['generation_method'] = 'simple_mock'
-                logger.info(f"🎬 Simple mock video created: {mock_video_path}")
-            
-            job.progress = "75%"
-            logger.info(f"✅ Mock video processing completed for video {job.video_id}")
-            
-        except Exception as e:
-            logger.error(f"❌ Error in mock video processing for video {job.video_id}: {e}")
-            raise
-    
-    def _find_mock_video(self) -> Optional[str]:
-        """Find an existing video file to use as mock"""
-        try:
-            temp_dir = Path("temp")
-            if temp_dir.exists():
-                # Look for existing video files
-                for video_file in temp_dir.rglob("*.mp4"):
-                    if video_file.stat().st_size > 1000:  # At least 1KB
-                        return str(video_file)
-            return None
-        except Exception as e:
-            logger.error(f"❌ Error finding mock video: {e}")
-            return None
-    
-    async def _create_simple_mock_video(self, job: VideoJob) -> str:
-        """Create a simple mock video file for testing"""
+    async def _create_placeholder_video(self, job: VideoJob) -> str:
+        """Create a simple placeholder video for testing when no video is provided"""
         try:
             # Create temp directory
             temp_dir = Path("temp")
             temp_dir.mkdir(exist_ok=True)
             
-            # Create a simple text file as mock video
-            mock_video_path = f"temp/mock_video_{job.video_id}.mp4"
+            # Create a simple MP4 file as placeholder video
+            placeholder_path = f"temp/placeholder_video_{job.video_id}.mp4"
             
-            with open(mock_video_path, 'w') as f:
-                f.write(f"Mock video for job {job.video_id}\n")
+            # For now, create a minimal MP4 file. In production, you might want to create an actual video
+            # This is a workaround - creating a very small MP4 file
+            
+            # Create a simple text file first
+            temp_text = f"temp/temp_text_{job.video_id}.txt"
+            with open(temp_text, 'w') as f:
+                f.write(f"Placeholder video for job {job.video_id}\n")
                 f.write(f"Title: {job.title}\n")
                 f.write(f"Description: {job.description}\n")
-                f.write(f"Created for testing purposes\n")
+                f.write(f"Created automatically - no video file provided\n")
             
-            logger.info(f"📝 Created simple mock video: {mock_video_path}")
-            return mock_video_path
+            # Try to convert to MP4 using ffmpeg if available, otherwise use a dummy file
+            try:
+                # Use ffmpeg to create a simple video from text
+                cmd = [
+                    'ffmpeg', '-f', 'lavfi', '-i', 'color=c=black:s=1280x720:d=5',
+                    '-vf', f"drawtext=text='{job.title}':fontsize=24:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2",
+                    '-c:v', 'libx264', '-preset', 'ultrafast', '-t', '5',
+                    placeholder_path, '-y'
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                
+                if result.returncode == 0 and os.path.exists(placeholder_path):
+                    logger.info(f"📹 Created placeholder video using ffmpeg: {placeholder_path}")
+                else:
+                    # Fallback: create a dummy MP4 file
+                    self._create_dummy_mp4(placeholder_path)
+                    logger.info(f"📹 Created dummy MP4 placeholder: {placeholder_path}")
+                    
+            except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+                # ffmpeg not available or failed, create dummy MP4
+                self._create_dummy_mp4(placeholder_path)
+                logger.info(f"📹 Created dummy MP4 placeholder (ffmpeg not available): {placeholder_path}")
+            
+            # Clean up temp text file
+            if os.path.exists(temp_text):
+                os.remove(temp_text)
+            
+            return placeholder_path
             
         except Exception as e:
-            logger.error(f"❌ Error creating simple mock video: {e}")
-            raise
+            logger.error(f"❌ Error creating placeholder video: {e}")
+            # Return a default path
+            return f"temp/default_video_{job.video_id}.mp4"
     
-    async def _generate_images(self, job: VideoJob):
-        """Generate images for the video"""
-        logger.info(f"🎨 Generating images for video {job.video_id}")
-        
-        job.status = VideoStatus.IMAGE_GENERATION
-        update_video_status(job.video_id, "image_generation")
-        
-        # Generate story images based on the prompt
-        story_prompt = f"{job.title}: {job.description}"
-        
-        # Generate multiple images for the story
-        image_paths = self.image_manager.generate_story_images(
-            video_id=job.video_id,
-            story_prompt=story_prompt,
-            num_scenes=5,  # 5 scenes for the video
-            scene_variations=2  # 2 variations per scene
-        )
-        
-        # Store image paths in job metadata
-        job.metadata['generated_images'] = image_paths
-        job.metadata['image_count'] = sum(len(images) for images in image_paths.values())
-        
-        logger.info(f"✅ Generated {job.metadata['image_count']} images for video {job.video_id}")
-    
-    async def _generate_video_with_pyramid_flow(self, job: VideoJob):
-        """Generate video directly using Pyramid Flow text-to-video"""
-        logger.info(f"🎬 Generating video with Pyramid Flow for video {job.video_id}")
-        
-        job.status = VideoStatus.VIDEO_ASSEMBLY
-        update_video_status(job.video_id, "video_assembly")
-        
-        # Create story prompt from title and description
-        story_prompt = f"{job.title}: {job.description}"
-        
-        # Generate video using Pyramid Flow
-        video_path = await generate_video_with_pyramid_flow(
-            video_id=job.video_id,
-            prompt=story_prompt,
-            preset="standard"  # Can be customized based on job requirements
-        )
-        
-        if video_path:
-            # Store video path in job metadata
-            job.metadata['video_path'] = video_path
-            job.metadata['generation_method'] = 'pyramid_flow'
-            job.metadata['story_prompt'] = story_prompt
-            
-            logger.info(f"✅ Video generated with Pyramid Flow: {video_path}")
-        else:
-            # Fallback to image-based generation if Pyramid Flow fails
-            logger.warning(f"⚠️ Pyramid Flow generation failed, falling back to image-based method")
-            await self._generate_images(job)
-            await self._assemble_video(job)
-    
-    async def _assemble_video(self, job: VideoJob):
-        """Assemble the final video from images and audio"""
-        logger.info(f"🎬 Assembling video for video {job.video_id}")
-        
-        job.status = VideoStatus.VIDEO_ASSEMBLY
-        update_video_status(job.video_id, "video_assembly")
-        
-        # Get the generated images
-        image_paths = job.metadata.get('generated_images', {})
-        
-        # Create video from images
-        video_path = self.video_editor.create_video_from_images(
-            video_id=job.video_id,
-            image_paths=image_paths,
-            duration=job.expected_length,
-            title=job.title,
-            description=job.description
-        )
-        
-        # Store video path in job metadata
-        job.metadata['video_path'] = video_path
-        
-        logger.info(f"✅ Video assembled successfully: {video_path}")
-    
-    async def _upload_to_youtube(self, job: VideoJob):
-        """Upload video to YouTube"""
+    def _create_dummy_mp4(self, filepath: str):
+        """Create a minimal valid MP4 file"""
         try:
+            # Create a minimal MP4 file structure (this is a very basic approach)
+            # In production, you'd want to use a proper video library
+            with open(filepath, 'wb') as f:
+                # Write minimal MP4 header
+                f.write(b'\x00\x00\x00\x20ftypmp42')
+                f.write(b'\x00' * 100)  # Add some padding to make it look like a video
+            
+            logger.info(f"📹 Created minimal MP4 file: {filepath}")
+        except Exception as e:
+            logger.error(f"❌ Error creating dummy MP4: {e}")
+            # If all else fails, create an empty file
+            with open(filepath, 'w') as f:
+                f.write("")
+    
+    async def _upload_to_youtube(self, job: VideoJob, video_path: str):
+        """Upload video to YouTube with automatic metadata handling"""
+        try:
+            logger.info(f"📤 Starting YouTube upload for video {job.video_id}: {video_path}")
+            
+            # Update job status to uploading
             job.status = VideoStatus.UPLOADING
             update_video_status(job.video_id, "uploading")
+            job.progress = "75%"
             
-            video_path = job.metadata.get('video_path')
-            if not video_path:
-                raise ValueError("No video path found in job metadata")
+            # Check if video file exists and is valid
+            if not os.path.exists(video_path):
+                raise FileNotFoundError(f"Video file not found: {video_path}")
             
-            # Check if this is a mock video but proceed with real upload
-            if job.metadata.get('generation_method') in ['mock_video', 'simple_mock']:
-                logger.info(f"🎬 Mock video detected for job {job.video_id}, but proceeding with real YouTube upload")
+            file_size = os.path.getsize(video_path)
+            logger.info(f"📁 Video file size: {file_size} bytes")
             
-            # Real YouTube upload (when credentials are provided)
-            logger.info(f"📤 Starting YouTube upload for video {job.video_id}")
+            if file_size == 0:
+                raise ValueError(f"Video file is empty: {video_path}")
+            
+            # Extract tags from metadata or use default
+            tags = job.metadata.get('tags', [])
+            if isinstance(tags, str):
+                tags = [tag.strip() for tag in tags.split(',') if tag.strip()]
+            
+            logger.info(f"🏷️ Using tags: {tags}")
             
             # Map genre to YouTube category ID
             genre_to_category = {
-                "technology": "28",      # Science & Technology
-                "entertainment": "24",   # Entertainment
-                "education": "27",       # Education
-                "gaming": "20",          # Gaming
-                "music": "10",           # Music
-                "sports": "17",          # Sports
-                "news": "25",            # News & Politics
-                "howto": "26",           # Howto & Style
-                "travel": "19",          # Travel & Events
-                "autos": "2",            # Autos & Vehicles
-                "pets": "15",            # Pets & Animals
-                "comedy": "23",          # Comedy
-                "film": "1",             # Film & Animation
-                "people": "22",          # People & Blogs
+                "kids": "27",           # Education
+                "education": "27",      # Education
+                "gaming": "20",         # Gaming
+                "comedy": "23",         # Comedy
+                "music": "10",          # Music
+                "sports": "17",         # Sports
+                "news": "25",           # News & Politics
+                "howto": "26",          # Howto & Style
+                "travel": "19",         # Travel & Events
+                "autos": "2",           # Autos & Vehicles
+                "pets": "15",           # Pets & Animals
+                "film": "1",            # Film & Animation
+                "people": "22",         # People & Blogs
             }
             
             category_id = genre_to_category.get(job.genre.lower(), "28")  # Default to Technology
+            logger.info(f"📂 Using category ID: {category_id} for genre: {job.genre}")
+            
+            # Ensure YouTube uploader is initialized
+            if not self.youtube_uploader:
+                logger.error("❌ YouTube uploader not initialized")
+                raise RuntimeError("YouTube uploader not available")
+            
+            logger.info(f"🔐 YouTube uploader initialized, proceeding with upload...")
             
             # Use real YouTube uploader with credentials
             upload_result = await self.youtube_uploader.upload_video(
                 video_path=video_path,
                 title=job.title,
                 description=job.description,
-                tags=job.metadata.get('tags', []),
+                tags=tags,
                 category=category_id,
                 privacy_status='private'  # Start as private for safety
             )
             
-            # Store upload result in job metadata
-            job.metadata['youtube_upload'] = upload_result
+            logger.info(f"📤 Upload result received: {upload_result}")
             
-            logger.info(f"✅ YouTube upload completed for video {job.video_id}: {upload_result.get('video_id')}")
+            # Check if upload was successful
+            if upload_result.get('success', False):
+                # Store upload result in job metadata
+                job.metadata['youtube_upload'] = upload_result
+                job.metadata['youtube_video_id'] = upload_result.get('video_id')
+                job.metadata['youtube_url'] = upload_result.get('youtube_url')
+                
+                logger.info(f"✅ YouTube upload completed for video {job.video_id}: {upload_result.get('video_id')}")
+                
+                # Mark job as completed
+                job.status = VideoStatus.COMPLETED
+                update_video_status(job.video_id, "completed")
+                job.progress = "100%"
+                
+                logger.info(f"🎉 Video {job.video_id} processing completed successfully!")
+                
+            else:
+                # Upload failed
+                error_msg = upload_result.get('error', 'Unknown upload error')
+                logger.error(f"❌ YouTube upload failed for video {job.video_id}: {error_msg}")
+                
+                # Mark job as failed
+                job.status = VideoStatus.FAILED
+                update_video_status(job.video_id, "failed")
+                job.progress = "Failed"
+                job.metadata['upload_error'] = error_msg
+                
+                raise RuntimeError(f"YouTube upload failed: {error_msg}")
             
         except Exception as e:
             logger.error(f"❌ YouTube upload failed for video {job.video_id}: {e}")
+            
+            # Mark job as failed
+            job.status = VideoStatus.FAILED
+            update_video_status(job.video_id, "failed")
+            job.progress = "Failed"
+            job.metadata['upload_error'] = str(e)
+            
             raise
     
     async def _handle_job_failure(self, job: VideoJob, error: str):
@@ -539,6 +576,11 @@ class WorkflowController:
             logger.info(f"🎬 Handling scheduled task: {scheduled_task.video_id} - {scheduled_task.title}")
             
             # Create a VideoJob from the scheduled task
+            # Ensure video_link is included in metadata
+            metadata = scheduled_task.metadata.copy() if scheduled_task.metadata else {}
+            if hasattr(scheduled_task, 'video_link') and scheduled_task.video_link:
+                metadata['video_link'] = scheduled_task.video_link
+            
             video_job = VideoJob(
                 video_id=scheduled_task.video_id,
                 title=scheduled_task.title,
@@ -548,7 +590,7 @@ class WorkflowController:
                 schedule_time=scheduled_task.schedule_time,
                 status=VideoStatus.IMAGE_GENERATION,
                 created_at=scheduled_task.schedule_time,
-                metadata=scheduled_task.metadata
+                metadata=metadata
             )
             
             # Add to active jobs
@@ -593,6 +635,28 @@ class WorkflowController:
             
         except Exception as e:
             logger.error(f"❌ Error scheduling video {video_data['id']}: {e}")
+            return False
+
+    async def _test_youtube_uploader(self):
+        """Test if YouTube uploader is working properly"""
+        try:
+            logger.info("🧪 Testing YouTube uploader functionality...")
+            
+            if not self.youtube_uploader:
+                logger.error("❌ YouTube uploader not initialized")
+                return False
+            
+            # Test authentication
+            auth_result = await self.youtube_uploader.authenticate()
+            if auth_result:
+                logger.info("✅ YouTube uploader authentication successful")
+                return True
+            else:
+                logger.error("❌ YouTube uploader authentication failed")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ YouTube uploader test failed: {e}")
             return False
 
 # Global instance

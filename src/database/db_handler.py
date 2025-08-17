@@ -47,15 +47,15 @@ def save_video(data: dict):
     INSERT INTO videos (
         title, description, captions, tags, video_url, genre,
         expected_length, schedule_time, platforms, video_type,
-        music_pref, channel_name, extra_metadata
+        music_pref, channel_name, extra_metadata, status
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         data.get("title"),
         data.get("description"),
         data.get("captions"),
         ",".join(data.get("tags", [])) if isinstance(data.get("tags"), list) else data.get("tags"),
-        data.get("video_link"),
+        data.get("video_link"),  # This maps to video_url in the database
         data.get("genre"),
         data.get("expected_length"),
         data.get("schedule_time"),
@@ -63,10 +63,18 @@ def save_video(data: dict):
         data.get("video_type"),
         data.get("music_pref"),
         data.get("channel_name"),
-        json.dumps(data.get("extra_metadata", {}))
+        json.dumps(data.get("extra_metadata", {})),
+        "pending"  # Default status
     ))
+    
+    # Get the inserted video ID
+    video_id = cursor.lastrowid
+    
     conn.commit()
     conn.close()
+    
+    print(f"✅ Video saved successfully with ID: {video_id}")
+    return video_id
 
 def get_pending_videos():
     """Get all pending videos from the database."""
@@ -75,9 +83,9 @@ def get_pending_videos():
     
     cursor.execute("""
     SELECT id, title, description, genre, expected_length, schedule_time, 
-           platforms, video_type, music_pref, channel_name, extra_metadata, status
+           platforms, video_type, music_pref, channel_name, extra_metadata, status, video_url
     FROM videos 
-    WHERE status IN ('pending', 'image_generation', 'video_assembly', 'uploading')
+    WHERE status IN ('pending', 'uploading')
     ORDER BY schedule_time ASC
     """)
     
@@ -114,7 +122,7 @@ def get_video_by_id(video_id: int):
     
     cursor.execute("""
     SELECT id, title, description, genre, expected_length, schedule_time, 
-           platforms, video_type, music_pref, channel_name, extra_metadata, status
+           platforms, video_type, music_pref, channel_name, extra_metadata, status, video_url
     FROM videos 
     WHERE id = ?
     """, (video_id,))
@@ -124,7 +132,7 @@ def get_video_by_id(video_id: int):
     
     if row:
         columns = ['id', 'title', 'description', 'genre', 'expected_length', 'schedule_time', 
-                  'platforms', 'video_type', 'music_pref', 'channel_name', 'extra_metadata', 'status']
+                  'platforms', 'video_type', 'music_pref', 'channel_name', 'extra_metadata', 'status', 'video_url']
         return dict(zip(columns, row))
     
     return None
@@ -289,3 +297,17 @@ def get_video_processing_stats():
     
     conn.close()
     return stats
+
+def delete_all_videos():
+    """Delete all videos from the database."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute("DELETE FROM videos")
+    deleted_count = cursor.rowcount
+    
+    conn.commit()
+    conn.close()
+    
+    print(f"✅ Deleted {deleted_count} videos from database")
+    return deleted_count
